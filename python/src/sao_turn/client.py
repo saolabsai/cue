@@ -88,6 +88,8 @@ class TurnConfig:
     min_silence_ms: int = 200
     max_silence_ms: int = 8_000
     max_backchannel_ms: int = 1_200
+    early_silence_ms: int | None = None
+    early_completion_threshold: float | None = None
 
     def __post_init__(self) -> None:
         for name in ("speech_start_threshold", "speech_end_threshold", "completion_threshold"):
@@ -100,6 +102,14 @@ class TurnConfig:
             raise ValueError("max_silence_ms must be at least min_silence_ms")
         if self.max_backchannel_ms < self.min_voiced_ms:
             raise ValueError("max_backchannel_ms must be at least min_voiced_ms")
+        gate, threshold = self.early_silence_ms, self.early_completion_threshold
+        if (gate is None) != (threshold is None):
+            raise ValueError("early_silence_ms and early_completion_threshold must be set together")
+        if gate is not None and threshold is not None:
+            _integer("early_silence_ms", gate, 1, self.min_silence_ms - 1)
+            _probability("early_completion_threshold", threshold)
+            if threshold < self.completion_threshold:
+                raise ValueError("early_completion_threshold must be at least completion_threshold")
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> TurnConfig:
@@ -111,7 +121,7 @@ class TurnConfig:
         return cls(**dict(value))
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        return {name: value for name, value in asdict(self).items() if value is not None}
 
 
 def _reject_constant(value: str) -> None:
@@ -161,6 +171,8 @@ class SaoTurnClient:
 
     Paths are converted to absolute paths at construction. ``config`` is an
     optional JSON file path; use ``TurnConfig.to_dict()`` when authoring it.
+    Pass ``joint_model`` for the joint backend, or ``model`` and ``vad_model``
+    for the legacy pair.
     Native readiness is confirmed by an empty reset packet after model loading.
     """
 
@@ -168,8 +180,9 @@ class SaoTurnClient:
         self,
         *,
         executable: str | Path,
-        model: str | Path,
-        vad_model: str | Path,
+        model: str | Path | None = None,
+        vad_model: str | Path | None = None,
+        joint_model: str | Path | None = None,
         runtime: str | Path | None = None,
         config: str | Path | None = None,
         threads: int = 1,
@@ -185,9 +198,14 @@ class SaoTurnClient:
         for name, value in (("request_timeout", request_timeout), ("startup_timeout", startup_timeout), ("shutdown_timeout", shutdown_timeout)):
             if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
                 raise ValueError(f"{name} must be a positive finite duration")
+        if joint_model is None and (model is None or vad_model is None):
+            raise ValueError("provide model and vad_model, or joint_model")
+        if joint_model is not None and (model is not None or vad_model is not None):
+            raise ValueError("joint_model cannot be combined with model or vad_model")
         self.executable = Path(executable).expanduser().resolve()
-        self.model = Path(model).expanduser().resolve()
-        self.vad_model = Path(vad_model).expanduser().resolve()
+        self.model = Path(model).expanduser().resolve() if model is not None else None
+        self.vad_model = Path(vad_model).expanduser().resolve() if vad_model is not None else None
+        self.joint_model = Path(joint_model).expanduser().resolve() if joint_model is not None else None
         self.runtime = Path(runtime).expanduser().resolve() if runtime is not None else None
         self.config = Path(config).expanduser().resolve() if config is not None else None
         self.threads = threads
@@ -216,7 +234,7 @@ class SaoTurnClient:
         return self._context
 
     def _command(self) -> list[str]:
-        for name in ("executable", "model", "vad_model", "runtime", "config"):
+        for name in ("executable", "model", "vad_model", "joint_model", "runtime", "config"):
             path = getattr(self, name)
             if path is not None and not path.is_file():
                 raise ValueError(f"{name} is not a file: {path}")
@@ -224,7 +242,11 @@ class SaoTurnClient:
             if self.config.stat().st_size > 65_536:
                 raise ValueError("config JSON exceeds 65536 bytes")
             TurnConfig.from_dict(json.loads(self.config.read_text(encoding="utf-8"), parse_constant=_reject_constant))
-        command = [str(self.executable), "--model", str(self.model), "--vad-model", str(self.vad_model), "--threads", str(self.threads)]
+        command = [str(self.executable), "--threads", str(self.threads)]
+        if self.joint_model is not None:
+            command.extend(["--joint-model", str(self.joint_model)])
+        else:
+            command.extend(["--model", str(self.model), "--vad-model", str(self.vad_model)])
         if self.runtime is not None:
             command.extend(["--runtime", str(self.runtime)])
         if self.config is not None:

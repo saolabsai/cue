@@ -11,6 +11,11 @@ pub struct Config {
     pub completion_threshold: f32,
     pub min_voiced_ms: u64,
     pub min_silence_ms: u64,
+    /// Optional earlier acoustic check with a stricter completion threshold.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub early_silence_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub early_completion_threshold: Option<f32>,
     /// Hard silence cap, including explicit waits and incomplete-input guards.
     /// Reaching this cap emits a forced end, even without a completion score.
     pub max_silence_ms: u64,
@@ -25,6 +30,8 @@ impl Default for Config {
             completion_threshold: 0.50,
             min_voiced_ms: 200,
             min_silence_ms: 200,
+            early_silence_ms: None,
+            early_completion_threshold: None,
             max_silence_ms: 8_000,
             max_backchannel_ms: 1_200,
         }
@@ -44,6 +51,19 @@ impl Config {
         }
         if self.min_silence_ms == 0 || self.max_silence_ms < self.min_silence_ms {
             bail!("silence limits must satisfy 0 < min_silence_ms <= max_silence_ms");
+        }
+        match (self.early_silence_ms, self.early_completion_threshold) {
+            (Some(gate), Some(threshold)) => {
+                probability("early_completion_threshold", threshold)?;
+                if gate == 0 || gate >= self.min_silence_ms {
+                    bail!("early_silence_ms must be positive and below min_silence_ms");
+                }
+                if threshold < self.completion_threshold {
+                    bail!("early_completion_threshold must be at least completion_threshold");
+                }
+            }
+            (None, None) => {}
+            _ => bail!("early_silence_ms and early_completion_threshold must be set together"),
         }
         if self.max_backchannel_ms < self.min_voiced_ms {
             bail!("max_backchannel_ms must be at least min_voiced_ms");
@@ -147,6 +167,7 @@ pub struct TurnEngine {
     voiced_ms: u64,
     speech_active: bool,
     completion_probability: Option<f32>,
+    early_prediction_used: bool,
     context: Context,
     last_wait_reason: Option<&'static str>,
     interruption_emitted: bool,
@@ -166,6 +187,7 @@ impl TurnEngine {
             voiced_ms: 0,
             speech_active: false,
             completion_probability: None,
+            early_prediction_used: false,
             context: Context::default(),
             last_wait_reason: None,
             interruption_emitted: false,
@@ -185,8 +207,8 @@ impl TurnEngine {
         self.terminal_text = None;
     }
 
-    /// Whether the current paused turn needs its first completion prediction.
-    /// A pause needs only one score; new speech invalidates that cached score.
+    /// Whether the paused turn needs a score for the current silence gate.
+    /// Each gate requests at most one score before speech resumes.
     /// Call after supplying the latest VAD/context observation. Calling update
     /// again at the same timestamp to attach the score is supported.
     pub fn needs_prediction(&self, at_ms: u64) -> bool {
@@ -201,11 +223,16 @@ impl TurnEngine {
         {
             return false;
         }
-        let silence = at_ms.saturating_sub(self.last_speech_ms.unwrap_or(at_ms));
-        silence >= self.config.min_silence_ms
+        let silence = self.silence_ms(at_ms);
+        (silence >= self.config.min_silence_ms || self.early_check_due(silence))
             && silence < self.config.max_silence_ms
             && self.guard_reason().is_none()
             && !self.is_backchannel()
+    }
+
+    /// Stage of a completion check already requested by `needs_prediction`.
+    pub(crate) fn prediction_is_early(&self, at_ms: u64) -> bool {
+        self.silence_ms(at_ms) < self.config.min_silence_ms
     }
 
     pub fn features(&self, at_ms: u64) -> Option<Features> {
@@ -273,6 +300,7 @@ impl TurnEngine {
             self.turn_start_ms.get_or_insert(at_ms);
             self.last_speech_ms = Some(at_ms);
             self.completion_probability = None;
+            self.early_prediction_used = false;
             self.last_wait_reason = None;
         }
 
@@ -296,7 +324,10 @@ impl TurnEngine {
 
         // Never accept a score while speech is active, including a score that
         // arrives in the same observation as resumed speech.
-        if !self.speech_active {
+        let silence_ms = self.silence_ms(at_ms);
+        if !self.speech_active
+            && (self.config.early_silence_ms.is_none() || silence_ms >= self.config.min_silence_ms)
+        {
             if let Some(score) = observation.completion_probability {
                 self.completion_probability = Some(score);
             }
@@ -326,8 +357,25 @@ impl TurnEngine {
         if self.speech_active {
             return Ok(None);
         }
-        let silence_ms = self.silence_ms(at_ms);
         if silence_ms < self.config.min_silence_ms {
+            if let (Some(score), Some(threshold)) = (
+                observation.completion_probability,
+                self.config.early_completion_threshold,
+            ) {
+                if self.early_check_due(silence_ms)
+                    && self.guard_reason().is_none()
+                    && !self.is_backchannel()
+                {
+                    self.early_prediction_used = true;
+                    if score >= threshold {
+                        self.completion_probability = Some(score);
+                        let decision =
+                            self.decision(DecisionKind::End, at_ms, "early_model_complete", false);
+                        self.finish_turn();
+                        return Ok(Some(decision));
+                    }
+                }
+            }
             return Ok(None);
         }
 
@@ -380,6 +428,14 @@ impl TurnEngine {
 
     fn silence_ms(&self, at_ms: u64) -> u64 {
         at_ms.saturating_sub(self.last_speech_ms.unwrap_or(at_ms))
+    }
+
+    fn early_check_due(&self, silence_ms: u64) -> bool {
+        !self.early_prediction_used
+            && self
+                .config
+                .early_silence_ms
+                .is_some_and(|gate| silence_ms >= gate)
     }
 
     fn guard_reason(&self) -> Option<&'static str> {
@@ -437,6 +493,7 @@ impl TurnEngine {
         self.voiced_ms = 0;
         self.speech_active = false;
         self.completion_probability = None;
+        self.early_prediction_used = false;
         self.context = Context::default();
         self.last_wait_reason = None;
         self.interruption_emitted = false;
@@ -626,6 +683,77 @@ mod tests {
             .unwrap()
             .is_none());
         assert!(!engine.needs_prediction(500));
+    }
+
+    #[test]
+    fn early_rejection_requires_a_fresh_score_at_the_late_gate() {
+        let mut engine = TurnEngine::new(Config {
+            early_silence_ms: Some(32),
+            early_completion_threshold: Some(0.99),
+            ..engine().config().clone()
+        })
+        .unwrap();
+        voiced(&mut engine, Context::default());
+        assert!(!engine.needs_prediction(231));
+        assert!(engine.needs_prediction(232));
+        assert!(engine
+            .update(observation(232, 0.0, Some(0.9), ""))
+            .unwrap()
+            .is_none());
+        assert!(!engine.needs_prediction(264));
+        assert!(engine
+            .update(observation(400, 0.0, None, ""))
+            .unwrap()
+            .is_none());
+        assert!(engine.needs_prediction(400));
+        assert!(engine
+            .update(observation(400, 0.0, Some(0.1), ""))
+            .unwrap()
+            .is_none());
+        assert!(!engine.needs_prediction(432));
+        engine.update(observation(464, 0.9, None, "")).unwrap();
+        engine.update(observation(496, 0.0, None, "")).unwrap();
+        assert!(engine.needs_prediction(528));
+        let decision = engine
+            .update(observation(528, 0.0, Some(0.99), ""))
+            .unwrap()
+            .unwrap();
+        assert_eq!(decision.kind, DecisionKind::End);
+        assert_eq!(decision.reason, "early_model_complete");
+        assert_eq!(decision.voiced_ms, 232);
+    }
+
+    #[test]
+    fn early_gate_respects_context_and_uses_late_score_if_hold_clears_late() {
+        let mut engine = TurnEngine::new(Config {
+            early_silence_ms: Some(32),
+            early_completion_threshold: Some(0.99),
+            ..engine().config().clone()
+        })
+        .unwrap();
+        voiced(
+            &mut engine,
+            Context {
+                text: "wait".into(),
+                ..Context::default()
+            },
+        );
+        assert!(!engine.needs_prediction(232));
+        assert!(engine
+            .update(observation(232, 0.0, Some(1.0), "wait"))
+            .unwrap()
+            .is_none());
+        assert!(engine
+            .update(observation(400, 0.0, None, "done"))
+            .unwrap()
+            .is_none());
+        assert!(engine.needs_prediction(400));
+        let decision = engine
+            .update(observation(400, 0.0, Some(0.5), "done"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(decision.kind, DecisionKind::End);
+        assert_eq!(decision.reason, "model_complete");
     }
 
     #[test]

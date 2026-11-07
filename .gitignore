@@ -1,6 +1,7 @@
 /target/
 /output/
 /reports/
+/tmp/
 /assets/models/
 /.venv/
 /.venv-*/

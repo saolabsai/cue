@@ -1,6 +1,6 @@
 //! Bounded PCM framing and shared acoustic observations for two policies.
 //! Input is mono 16 kHz float PCM in [-1, 1].
-use crate::inference::{SileroVad, SmartTurnModel};
+use crate::inference::{JointModel, SileroVad, SmartTurnModel};
 use crate::policy::{Config, Context, Decision, DecisionKind, Observation, TurnEngine};
 use anyhow::{ensure, Result};
 use serde::Serialize;
@@ -14,7 +14,33 @@ const WINDOW_SAMPLES: usize = SAMPLE_RATE * 8;
 pub trait AcousticBackend {
     fn speech_probability(&mut self, frame: &[f32]) -> Result<f32>;
     fn completion_probability(&mut self, audio: &[f32]) -> Result<f32>;
+    /// Single-output backends use the same score at either pause gate.
+    fn completion_probability_for_gate(&mut self, audio: &[f32], _early: bool) -> Result<f32> {
+        self.completion_probability(audio)
+    }
+    /// A completion score already computed by the most recent speech call.
+    fn joint_completion_probability(&self) -> Option<f32> {
+        None
+    }
     fn reset(&mut self);
+}
+
+impl<B: AcousticBackend + ?Sized> AcousticBackend for Box<B> {
+    fn speech_probability(&mut self, frame: &[f32]) -> Result<f32> {
+        (**self).speech_probability(frame)
+    }
+    fn completion_probability(&mut self, audio: &[f32]) -> Result<f32> {
+        (**self).completion_probability(audio)
+    }
+    fn completion_probability_for_gate(&mut self, audio: &[f32], early: bool) -> Result<f32> {
+        (**self).completion_probability_for_gate(audio, early)
+    }
+    fn joint_completion_probability(&self) -> Option<f32> {
+        (**self).joint_completion_probability()
+    }
+    fn reset(&mut self) {
+        (**self).reset();
+    }
 }
 
 pub struct NeuralBackend {
@@ -29,8 +55,45 @@ impl AcousticBackend for NeuralBackend {
     fn completion_probability(&mut self, audio: &[f32]) -> Result<f32> {
         self.turn.predict(audio)
     }
+    fn completion_probability_for_gate(&mut self, audio: &[f32], early: bool) -> Result<f32> {
+        self.turn.predict_for_gate(audio, early)
+    }
     fn reset(&mut self) {
         self.vad.reset();
+    }
+}
+
+/// One recurrent model call per audio frame supplies both acoustic scores.
+pub struct JointBackend {
+    model: JointModel,
+    completion: Option<f32>,
+}
+
+impl JointBackend {
+    pub fn new(model: JointModel) -> Self {
+        Self {
+            model,
+            completion: None,
+        }
+    }
+}
+
+impl AcousticBackend for JointBackend {
+    fn speech_probability(&mut self, frame: &[f32]) -> Result<f32> {
+        let (speech, completion) = self.model.process(frame)?;
+        self.completion = Some(completion);
+        Ok(speech)
+    }
+    fn completion_probability(&mut self, _: &[f32]) -> Result<f32> {
+        self.completion
+            .ok_or_else(|| anyhow::anyhow!("joint backend has no processed frame"))
+    }
+    fn joint_completion_probability(&self) -> Option<f32> {
+        self.completion
+    }
+    fn reset(&mut self) {
+        self.model.reset();
+        self.completion = None;
     }
 }
 
@@ -41,13 +104,17 @@ pub struct FrameResult {
     pub completion_probability: Option<f32>,
     pub decision: Option<Decision>,
     pub baseline_decision: Option<Decision>,
-    /// Includes Rust feature extraction and ONNX execution, excludes model loading.
+    /// Legacy completion call including Rust features and ONNX, excluding loading.
     pub inference_ms: Option<f64>,
     /// Shared inference cost when the candidate actually requested a new score.
     pub candidate_inference_ms: Option<f64>,
     /// Shared inference cost when the diagnostic baseline requested a new score.
     pub baseline_inference_ms: Option<f64>,
+    /// Separate legacy VAD call. Zero when inference supplies both scores.
     pub vad_ms: f64,
+    /// One joint PCM-to-scores call, including preprocessing and state handling.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub joint_inference_ms: Option<f64>,
     pub candidate_policy_ms: f64,
     pub baseline_policy_ms: f64,
 }
@@ -136,20 +203,29 @@ impl<B: AcousticBackend> StreamDetector<B> {
             let at_ms = self.samples_seen / (SAMPLE_RATE as u64 / 1000);
             let started = Instant::now();
             let speech_probability = self.backend.speech_probability(&self.pending)?;
-            let vad_ms = started.elapsed().as_secs_f64() * 1000.0;
+            let acoustic_ms = started.elapsed().as_secs_f64() * 1000.0;
+            let joint_score = self.backend.joint_completion_probability();
+            let joint_inference_ms = joint_score.map(|_| acoustic_ms);
             ensure!(
                 speech_probability.is_finite() && (0.0..=1.0).contains(&speech_probability),
                 "VAD returned an invalid probability"
             );
-            self.window.extend(self.pending.iter().copied());
-            self.pending.clear();
-            while self.window.len() > WINDOW_SAMPLES {
-                self.window.pop_front();
+            if let Some(score) = joint_score {
+                ensure!(
+                    score.is_finite() && (0.0..=1.0).contains(&score),
+                    "joint model returned an invalid completion probability"
+                );
+            } else {
+                self.window.extend(self.pending.iter().copied());
+                while self.window.len() > WINDOW_SAMPLES {
+                    self.window.pop_front();
+                }
             }
+            self.pending.clear();
             let observation = Observation {
                 at_ms,
                 speech_probability,
-                completion_probability: None,
+                completion_probability: joint_score,
                 context: context.clone(),
             };
             let started = Instant::now();
@@ -168,20 +244,34 @@ impl<B: AcousticBackend> StreamDetector<B> {
                 self.baseline.update(baseline_observation.clone())?
             };
             let mut baseline_policy_ms = started.elapsed().as_secs_f64() * 1000.0;
-            let mut completion_probability = None;
+            let mut completion_probability = joint_score;
             let mut inference_ms = None;
             let mut candidate_inference_ms = None;
             let mut baseline_inference_ms = None;
-            let candidate_needs_prediction = !self.candidate_finished
+            let candidate_needs_prediction = joint_score.is_none()
+                && !self.candidate_finished
                 && !preserve_action(&decision)
                 && self.candidate.needs_prediction(at_ms);
-            let baseline_needs_prediction = !self.baseline_finished
+            let baseline_needs_prediction = joint_score.is_none()
+                && !self.baseline_finished
                 && !preserve_action(&baseline_decision)
                 && self.baseline.needs_prediction(at_ms);
             if candidate_needs_prediction || baseline_needs_prediction {
+                // Active policies share the VAD clock and gate configuration.
+                // Context can suppress a request without changing its stage.
+                let early = if candidate_needs_prediction {
+                    self.candidate.prediction_is_early(at_ms)
+                } else {
+                    self.baseline.prediction_is_early(at_ms)
+                };
+                debug_assert!(
+                    !baseline_needs_prediction || early == self.baseline.prediction_is_early(at_ms)
+                );
                 let audio: Vec<f32> = self.window.iter().copied().collect();
                 let started = Instant::now();
-                let probability = self.backend.completion_probability(&audio)?;
+                let probability = self
+                    .backend
+                    .completion_probability_for_gate(&audio, early)?;
                 inference_ms = Some(started.elapsed().as_secs_f64() * 1000.0);
                 ensure!(
                     probability.is_finite() && (0.0..=1.0).contains(&probability),
@@ -231,7 +321,12 @@ impl<B: AcousticBackend> StreamDetector<B> {
                 decision,
                 baseline_decision,
                 inference_ms,
-                vad_ms,
+                vad_ms: if joint_score.is_some() {
+                    0.0
+                } else {
+                    acoustic_ms
+                },
+                joint_inference_ms,
                 candidate_inference_ms,
                 baseline_inference_ms,
                 candidate_policy_ms,
@@ -320,11 +415,53 @@ mod tests {
         );
     }
 
+    #[test]
+    fn joint_scores_update_during_a_pause_without_a_second_model_call() {
+        struct JointFrames {
+            frames: VecDeque<(f32, f32)>,
+            completion: Option<f32>,
+        }
+        impl AcousticBackend for JointFrames {
+            fn speech_probability(&mut self, _: &[f32]) -> Result<f32> {
+                let (speech, completion) = self.frames.pop_front().unwrap();
+                self.completion = Some(completion);
+                Ok(speech)
+            }
+            fn completion_probability(&mut self, _: &[f32]) -> Result<f32> {
+                panic!("joint backend already provided a completion score")
+            }
+            fn joint_completion_probability(&self) -> Option<f32> {
+                self.completion
+            }
+            fn reset(&mut self) {
+                self.completion = None;
+            }
+        }
+        let backend = JointFrames {
+            frames: [(0.9, 0.0), (0.9, 0.0), (0.0, 0.1), (0.0, 0.2), (0.0, 0.99)]
+                .into_iter()
+                .collect(),
+            completion: None,
+        };
+        let mut detector = StreamDetector::new(backend, short_config()).unwrap();
+        let frames = detector
+            .push(&[0.0; FRAME_SAMPLES * 5], &Context::default())
+            .unwrap();
+        assert!(frames.iter().all(|frame| frame.joint_inference_ms.is_some()
+            && frame.inference_ms.is_none()
+            && frame.vad_ms == 0.0));
+        assert!(frames[..4].iter().all(|frame| !is_end(&frame.decision)));
+        assert!(is_end(&frames[4].decision));
+        assert!(is_end(&frames[4].baseline_decision));
+        assert_eq!(frames[4].at_ms, 160);
+    }
+
     #[derive(Default)]
     struct ScriptedBackend {
         speech: VecDeque<f32>,
         scores: VecDeque<f32>,
         observed_audio: Vec<Vec<f32>>,
+        observed_early_gates: Vec<bool>,
         fail_vad: bool,
         fail_model: bool,
         reset_calls: usize,
@@ -355,6 +492,10 @@ mod tests {
                 anyhow::bail!("scripted model failure");
             }
             Ok(self.scores.pop_front().unwrap_or(1.0))
+        }
+        fn completion_probability_for_gate(&mut self, audio: &[f32], early: bool) -> Result<f32> {
+            self.observed_early_gates.push(early);
+            self.completion_probability(audio)
         }
         fn reset(&mut self) {
             self.reset_calls += 1;
@@ -412,6 +553,34 @@ mod tests {
             vec![(DecisionKind::End, 128, 64), (DecisionKind::End, 256, 64)]
         );
         assert_eq!(chunked.backend.observed_audio.len(), 2);
+    }
+
+    #[test]
+    fn early_and_late_checks_share_a_call_and_use_current_audio() {
+        let backend = ScriptedBackend::new(&[0.9, 0.9, 0.0, 0.0, 0.0], &[0.9, 0.8]);
+        let config = Config {
+            min_silence_ms: 64,
+            early_silence_ms: Some(32),
+            early_completion_threshold: Some(0.99),
+            ..short_config()
+        };
+        let mut detector =
+            StreamDetector::new_with_comparison_mode(backend, config, ComparisonMode::Segment)
+                .unwrap();
+        let frames = detector
+            .push(&[0.0; FRAME_SAMPLES * 5], &Context::default())
+            .unwrap();
+        assert_eq!(frames[3].completion_probability, Some(0.9));
+        assert!(!is_end(&frames[3].decision));
+        assert!(!is_end(&frames[3].baseline_decision));
+        assert_eq!(frames[4].completion_probability, Some(0.8));
+        assert!(is_end(&frames[4].decision));
+        assert!(is_end(&frames[4].baseline_decision));
+        let windows = &detector.backend.observed_audio;
+        assert_eq!(windows.len(), 2);
+        assert_eq!(windows[0].len(), FRAME_SAMPLES * 4);
+        assert_eq!(windows[1].len(), FRAME_SAMPLES * 5);
+        assert_eq!(detector.backend.observed_early_gates, [true, false]);
     }
 
     #[test]
