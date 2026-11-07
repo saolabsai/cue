@@ -98,6 +98,19 @@ class ContextTests(unittest.TestCase):
                 TurnConfig.from_dict(invalid)
         self.assertEqual(TurnConfig().completion_threshold, 0.5)
 
+    def test_early_completion_config_round_trip(self):
+        self.assertNotIn("early_silence_ms", TurnConfig().to_dict())
+        config = TurnConfig(early_silence_ms=32, early_completion_threshold=0.99)
+        self.assertEqual(TurnConfig.from_dict(config.to_dict()), config)
+        for invalid in [
+            {"early_silence_ms": 32},
+            {"early_completion_threshold": 0.99},
+            {"early_silence_ms": 200, "early_completion_threshold": 0.99},
+            {"early_silence_ms": 32, "early_completion_threshold": 0.4},
+        ]:
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                TurnConfig.from_dict(invalid)
+
 
 class ClientTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -144,6 +157,23 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
             await client.close()
             self.assertTrue(process.stdin.closed)
             self.assertFalse(client.running)
+
+    async def test_joint_model_starts_and_streams_without_legacy_paths(self):
+        joint = Path(self.directory.name) / "joint.onnx"
+        joint.touch()
+        response = native_response()
+        response["frames"][0].update(completion_probability=0.8, joint_inference_ms=0.12)
+        process = FakeProcess([EMPTY, response])
+        client = self.client(model=None, vad_model=None, joint_model=joint)
+        with patch("sao_turn.client.asyncio.create_subprocess_exec", new=AsyncMock(return_value=process)) as spawn:
+            await client.start()
+            command = spawn.call_args.args
+            self.assertEqual(command[command.index("--joint-model") + 1], str(joint.resolve()))
+            self.assertNotIn("--model", command)
+            self.assertNotIn("--vad-model", command)
+            frames = (await client.process_audio(bytes(1024)))["frames"]
+            self.assertEqual(frames[0]["joint_inference_ms"], 0.12)
+            self.assertEqual(frames[0]["completion_probability"], 0.8)
 
     async def test_timeouts_close_and_explicit_restart_is_supported(self):
         first = FakeProcess([EMPTY, None])

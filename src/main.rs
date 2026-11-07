@@ -1,10 +1,11 @@
 use anyhow::{bail, ensure, Context as _, Result};
 use clap::{Parser, Subcommand};
 use sao_turn::evaluation::{evaluate, SessionResult};
-use sao_turn::inference::{SileroVad, SmartTurnModel};
+use sao_turn::inference::{JointModel, SileroVad, SmartTurnModel};
 use sao_turn::policy::{Config, Context, DecisionKind, Observation, TurnEngine};
 use sao_turn::stream::{
-    ComparisonMode, FrameResult, NeuralBackend, StreamDetector, FRAME_SAMPLES, SAMPLE_RATE,
+    AcousticBackend, ComparisonMode, FrameResult, JointBackend, NeuralBackend, StreamDetector,
+    FRAME_SAMPLES, SAMPLE_RATE,
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::json;
@@ -14,10 +15,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 #[derive(Parser)]
-#[command(
-    version,
-    about = "Cue: streaming turn detection with Smart Turn and Silero"
-)]
+#[command(version, about = "Cue: streaming CPU turn detection")]
 struct Cli {
     #[arg(
         long,
@@ -27,6 +25,9 @@ struct Cli {
     model: PathBuf,
     #[arg(long, global = true, default_value = "assets/models/silero-vad.onnx")]
     vad_model: PathBuf,
+    /// Use one Cue joint speech/completion ONNX model for WAV, stream or benchmark.
+    #[arg(long, global = true)]
+    joint_model: Option<PathBuf>,
     /// ONNX Runtime shared library; alternatively set ORT_DYLIB_PATH.
     #[arg(long, global = true)]
     runtime: Option<PathBuf>,
@@ -57,7 +58,12 @@ enum Command {
     /// JSONL stdin packets: {"samples":[signed16...],"context":{...},"reset":false}.
     Stream,
     /// Replay recorded Observation JSONL without loading ONNX models.
-    Replay { input: PathBuf },
+    Replay {
+        input: PathBuf,
+        /// Treat scores as per-frame outputs from the joint model.
+        #[arg(long)]
+        joint_scores: bool,
+    },
     /// Evaluate paired SessionResult JSONL without neural inference.
     Compare { input: PathBuf },
     /// Run a WAV manifest through both policies, then evaluate first endpoints.
@@ -184,11 +190,18 @@ fn read_wav(path: &Path) -> Result<Vec<f32>> {
     Ok(audio)
 }
 
-fn backend(cli: &Cli) -> Result<NeuralBackend> {
-    Ok(NeuralBackend {
+fn backend(cli: &Cli) -> Result<Box<dyn AcousticBackend>> {
+    if let Some(path) = &cli.joint_model {
+        return Ok(Box::new(JointBackend::new(JointModel::load(
+            path,
+            cli.runtime.as_deref(),
+            cli.threads,
+        )?)));
+    }
+    Ok(Box::new(NeuralBackend {
         turn: SmartTurnModel::load(&cli.model, cli.runtime.as_deref(), cli.threads)?,
         vad: SileroVad::load(&cli.vad_model, cli.runtime.as_deref(), cli.threads)?,
-    })
+    }))
 }
 
 fn config(cli: &Cli) -> Result<Config> {
@@ -216,7 +229,7 @@ fn validate_events(events: &[ContextEvent], duration_ms: u64) -> Result<()> {
 }
 
 fn run_audio(
-    detector: &mut StreamDetector<NeuralBackend>,
+    detector: &mut StreamDetector<Box<dyn AcousticBackend>>,
     audio: &[f32],
     initial: &Context,
     events: &[ContextEvent],
@@ -240,6 +253,14 @@ fn run_audio(
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    ensure!(
+        cli.joint_model.is_none()
+            || matches!(
+                &cli.command,
+                Command::Wav { .. } | Command::Stream | Command::Benchmark { .. }
+            ),
+        "--joint-model is supported by wav, stream, and benchmark"
+    );
     let cfg = config(&cli)?;
     TurnEngine::new(cfg.clone())?;
     let stdout = io::stdout();
@@ -289,7 +310,7 @@ fn main() -> Result<()> {
                 &initial,
                 &events,
                 |frame, context| {
-                    if frame.inference_ms.is_some() {
+                    if frame.inference_ms.is_some() || frame.joint_inference_ms.is_some() {
                         calls += 1;
                     }
                     if frame.decision.is_some() || frame.baseline_decision.is_some() {
@@ -356,16 +377,21 @@ fn main() -> Result<()> {
                 out.flush()?;
             }
         }
-        Command::Replay { input } => {
+        Command::Replay {
+            input,
+            joint_scores,
+        } => {
             let mut candidate = TurnEngine::new(cfg.clone())?;
             let mut baseline = TurnEngine::new(cfg)?;
             let mut baseline_finished = false;
             for observation in read_jsonl::<Observation>(input)? {
                 let mut unscored = observation.clone();
-                unscored.completion_probability = None;
                 let mut raw = observation.clone();
                 raw.context = Context::default();
-                raw.completion_probability = None;
+                if !joint_scores {
+                    unscored.completion_probability = None;
+                    raw.completion_probability = None;
+                }
                 let mut decision = candidate.update(unscored)?;
                 let mut baseline_decision = if baseline_finished {
                     None
@@ -380,7 +406,7 @@ fn main() -> Result<()> {
                         )
                     })
                 };
-                if observation.completion_probability.is_some() {
+                if !joint_scores && observation.completion_probability.is_some() {
                     if !actionable(&decision) && candidate.needs_prediction(observation.at_ms) {
                         decision = candidate.update(observation.clone())?.or(decision);
                     }
@@ -437,6 +463,10 @@ fn main() -> Result<()> {
             )?;
             let mut writer = results.as_deref().map(new_output).transpose()?;
             let mut rows = Vec::new();
+            let mut acoustic_frames = 0_u64;
+            let mut vad_ms = 0.0;
+            let mut completion_ms = 0.0;
+            let mut joint_ms = 0.0;
             for entry in entries {
                 ensure!(entry.context.text.is_empty(),
                     "benchmark initial context cannot include a transcript; supply timestamped events to avoid future-text leakage");
@@ -468,6 +498,14 @@ fn main() -> Result<()> {
                     &entry.context,
                     &entry.events,
                     |frame, _| {
+                        acoustic_frames += 1;
+                        vad_ms += frame.vad_ms;
+                        completion_ms += frame.inference_ms.unwrap_or_default();
+                        if let Some(ms) = frame.joint_inference_ms {
+                            joint_ms += ms;
+                            row.baseline_inference_ms.push(ms);
+                            row.candidate_inference_ms.push(ms);
+                        }
                         if frame
                             .baseline_decision
                             .as_ref()
@@ -499,14 +537,26 @@ fn main() -> Result<()> {
                 }
                 rows.push(row);
             }
-            emit(
-                &mut out,
-                &json!({"comparison":evaluate(&rows)?,
-                "baseline":"Smart Turn v3.2 with identical VAD, thresholds and timeout; context disabled",
+            let mut report = json!({"comparison":evaluate(&rows)?,
                 "timing":"audio-clock endpoints; shared acoustic inference timings; excludes transport/STT and queueing",
-                "model_path":cli.model,"vad_model_path":cli.vad_model,"threads":cli.threads,"config":cfg,
-                "superiority_established":false}),
-            )?;
+                "threads":cli.threads,"config":cfg,"superiority_established":false,
+                "acoustic_compute":{"frames":acoustic_frames,"vad_ms":vad_ms,
+                    "completion_ms":completion_ms,"joint_ms":joint_ms,
+                    "total_ms":vad_ms + completion_ms + joint_ms}});
+            if let Some(path) = &cli.joint_model {
+                report["baseline"] = json!(
+                    "Cue joint model with identical thresholds and timeout; context disabled"
+                );
+                report["joint_model_path"] = json!(path);
+                report["timing"] = json!("audio-clock endpoints; one shared joint inference call per frame; excludes transport/STT and queueing");
+            } else {
+                report["baseline"] = json!(
+                    "Smart Turn v3.2 with identical VAD, thresholds and timeout; context disabled"
+                );
+                report["model_path"] = json!(cli.model);
+                report["vad_model_path"] = json!(cli.vad_model);
+            }
+            emit(&mut out, &report)?;
         }
     }
     Ok(())

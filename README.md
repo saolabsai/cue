@@ -6,6 +6,18 @@ Cue combines a Rust audio worker, pretrained Smart Turn v3.2 and Silero VAD,
 and an optional asyncio/Pipecat bridge. It emits `end`, `wait`, `backchannel`,
 and `interrupt` decisions so an application can decide when to respond.
 
+Cue also supports an opt-in joint speech and turn model, with a training and
+ONNX export recipe. See [the joint model guide](docs/JOINT_MODEL.md) for its
+architecture, mathematics, usage, and paired evaluation.
+
+**Research status:** the new trained candidates are experimental and have not
+passed the conversation safety checks. No trained Cue checkpoint is bundled
+or made the default by this change. The default remains Smart Turn plus
+Silero; the local research cascade in the [research results](docs/CURRENT_RESEARCH.md)
+is a separately configured system. Safe delivered decisions below 50 or
+100 ms, natural Hinglish generalization, and superiority over Silero VAD
+have not been established.
+
 The context policy adds experimental English rules for explicit waits,
 backchannels, interruption commands, and incomplete digit sequences. Both
 benchmark policies share the same pretrained acoustic inference. No accuracy
@@ -61,6 +73,12 @@ Input must be mono 16 kHz PCM16 or normalized float32 WAV. Cue does not
 resample, capture a microphone, or append silence. It reports an incomplete
 final 512-sample frame as `unprocessed_tail_samples`.
 
+An on-demand `--model` may expose two scalar ONNX outputs named `completion`
+and `early_completion`, in that order. Cue uses `early_completion` at the
+optional early silence gate and `completion` at the regular gate. The `score`
+command uses `completion`. Single-output models use the same probability at
+both gates.
+
 For continuous audio, start `sao-turn stream` and send JSONL packets:
 
 ```json
@@ -92,7 +110,7 @@ quality dataset is bundled.
 | `src/` | Rust frontend, ONNX inference, policy, stream framing, CLI, evaluation |
 | `tests/` | CLI and numerical frontend parity tests |
 | `python/` | Async subprocess client and optional Pipecat adapter |
-| `scripts/` | Pinned model downloader and its tests |
+| `scripts/` | Pinned pretrained model downloader, joint-model data/training/export, paired replay |
 | `assets/frontend/` | Deterministic synthetic fixtures used by default tests |
 | `configs/`, `examples/` | Policy settings and replay examples |
 | `docs/` | Streaming API, development, and evaluation guides |
@@ -105,6 +123,12 @@ application handles playback, interruptions, and stale STT results. Each
 detector owns one stream and runs synchronous inference. The optional text
 rules are English heuristics and do not establish Hindi/Hinglish semantic
 understanding. Validate thresholds and behavior on your own audio before use.
+
+Rust callers that construct `Config` or `FrameResult` with explicit struct
+literals must account for the new public fields; `Config` can use
+`..Default::default()` for unspecified settings. Legacy JSON and Python
+invocations remain supported. `joint_inference_ms` is omitted from legacy
+backend JSON responses.
 
 ## Contributing and licensing
 
